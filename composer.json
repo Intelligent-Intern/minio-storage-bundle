@@ -10,10 +10,14 @@
   },
   "require": {
     "php": "^8.2",
+    "ext-openssl": "*",
+    "ext-zlib": "*",
     "symfony/http-client": "7.2.*",
     "symfony/framework-bundle": "7.2.*",
     "league/flysystem":"^3.0",
-    "async-aws/s3": "^2.8"
+    "async-aws/s3": "^2.8",
+    "aws/aws-sdk-php": "^3.342",
+    "league/flysystem-aws-s3-v3": "^3.29"
   },
   "extra": {
     "branch-alias": {

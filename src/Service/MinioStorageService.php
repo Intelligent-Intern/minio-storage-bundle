@@ -4,7 +4,7 @@ namespace IntelligentIntern\MinioStorageBundle\Service;
 
 use App\Factory\LogServiceFactory;
 use App\Service\VaultService;
-use App\Contract\MinioServiceInterface;
+use App\Contract\StorageServiceInterface;
 use App\Contract\LogServiceInterface;
 use League\Flysystem\FilesystemException;
 use League\Flysystem\FilesystemOperator;
@@ -20,7 +20,7 @@ use Symfony\Contracts\HttpClient\Exception\RedirectionExceptionInterface;
 use Symfony\Contracts\HttpClient\Exception\ServerExceptionInterface;
 use Symfony\Contracts\HttpClient\Exception\TransportExceptionInterface;
 
-class MinioStorageService implements MinioServiceInterface
+class MinioStorageService implements StorageServiceInterface
 {
     private LogServiceInterface $logger;
     private FilesystemOperator $storage;
@@ -64,26 +64,43 @@ class MinioStorageService implements MinioServiceInterface
         $this->storage = new Filesystem($adapter);
     }
 
+    /**
+     * @param string $provider
+     * @return bool
+     */
     public function supports(string $provider): bool
     {
         return strtolower($provider) === 'minio';
     }
 
+    /**
+     * @param string $path
+     * @return string|null
+     */
     public function generatePresignedUrl(string $path): ?string
     {
         // Generate a temporary URL valid for 1 hour by default.
         return $this->storage->temporaryUrl($path, new DateTime('+1 hour'));
     }
 
+    /**
+     * @param string $path
+     * @param int $expirySeconds
+     * @return string|null
+     */
     public function generateExpiringDownloadUrl(string $path, int $expirySeconds): ?string
     {
         $expiry = new DateTime("+{$expirySeconds} seconds");
         return $this->storage->temporaryUrl($path, $expiry);
     }
 
+    /**
+     * @param string $path
+     * @param int $expirySeconds
+     * @return string|null
+     */
     public function generateExpiringUploadUrl(string $path, int $expirySeconds): ?string
     {
-        // Using the underlying S3 client to create a presigned PUT URL.
         $expiry = "+{$expirySeconds} seconds";
         try {
             $command = $this->s3Client->getCommand('PutObject', [
@@ -114,11 +131,20 @@ class MinioStorageService implements MinioServiceInterface
         $this->storage->delete($path);
     }
 
+    /**
+     * @param string $path
+     * @return bool
+     * @throws FilesystemException
+     */
     public function fileExists(string $path): bool
     {
         return $this->storage->fileExists($path);
     }
 
+    /**
+     * @param string $path
+     * @return string|null
+     */
     public function getFileContent(string $path): ?string
     {
         try {
@@ -129,6 +155,11 @@ class MinioStorageService implements MinioServiceInterface
         }
     }
 
+    /**
+     * @param string $directory
+     * @return array
+     * @throws FilesystemException
+     */
     public function listFiles(string $directory): array
     {
         $files = [];
@@ -142,26 +173,52 @@ class MinioStorageService implements MinioServiceInterface
         return $files;
     }
 
+    /**
+     * @param string $sourcePath
+     * @param string $destinationPath
+     * @return void
+     * @throws FilesystemException
+     */
     public function copyFile(string $sourcePath, string $destinationPath): void
     {
         $this->storage->copy($sourcePath, $destinationPath);
     }
 
+    /**
+     * @param string $sourcePath
+     * @param string $destinationPath
+     * @return void
+     * @throws FilesystemException
+     */
     public function moveFile(string $sourcePath, string $destinationPath): void
     {
         $this->storage->move($sourcePath, $destinationPath);
     }
 
+    /**
+     * @param string $path
+     * @return array
+     */
     public function getFileMetadata(string $path): array
     {
         try {
-            return $this->storage->getMetadata($path);
+            return [
+                'mimeType'     => $this->storage->mimeType($path),
+                'lastModified' => $this->storage->lastModified($path),
+                'fileSize'     => $this->storage->fileSize($path),
+                'visibility'   => $this->storage->visibility($path),
+            ];
         } catch (FilesystemException $e) {
             $this->logger->error("Error getting metadata for [$path]: " . $e->getMessage());
             return [];
         }
     }
 
+    /**
+     * @param string $path
+     * @param array $metadata
+     * @return void
+     */
     public function setFileMetadata(string $path, array $metadata): void
     {
         // Flysystem does not directly support updating metadata.
@@ -180,6 +237,11 @@ class MinioStorageService implements MinioServiceInterface
         }
     }
 
+    /**
+     * @param string $path
+     * @param array $tags
+     * @return void
+     */
     public function tagFile(string $path, array $tags): void
     {
         $tagSet = [];
@@ -197,6 +259,10 @@ class MinioStorageService implements MinioServiceInterface
         }
     }
 
+    /**
+     * @param string $path
+     * @return array
+     */
     public function getFileTags(string $path): array
     {
         try {
@@ -215,46 +281,74 @@ class MinioStorageService implements MinioServiceInterface
         }
     }
 
+    /**
+     * @param string $path
+     * @param string $visibility
+     * @return void
+     * @throws FilesystemException
+     */
     public function setFileVisibility(string $path, string $visibility): void
     {
         // Flysystem supports visibility updates.
         $this->storage->setVisibility($path, $visibility);
     }
 
+    /**
+     * @throws FilesystemException
+     */
     public function getFileVisibility(string $path): string
     {
         return $this->storage->visibility($path);
     }
 
+    /**
+     * @throws FilesystemException
+     */
     public function streamFile(string $path)
     {
         // Returns a stream resource
         return $this->storage->readStream($path);
     }
 
+    /**
+     * @throws FilesystemException
+     */
     public function createDirectory(string $path): void
     {
         // S3 is object storage, but Flysystem simulates directories.
         $this->storage->createDirectory($path);
     }
 
+    /**
+     * @throws FilesystemException
+     */
     public function deleteDirectory(string $path): void
     {
         $this->storage->deleteDirectory($path);
     }
 
+    /**
+     * @throws FilesystemException
+     */
     public function getFileChecksum(string $path, string $algorithm = 'sha256'): string
     {
         $content = $this->storage->read($path);
         return hash($algorithm, $content);
     }
 
+    /**
+     * @throws FilesystemException
+     */
     public function validateFileChecksum(string $path, string $expectedHash, string $algorithm = 'sha256'): bool
     {
         $computed = $this->getFileChecksum($path, $algorithm);
         return $computed === $expectedHash;
     }
 
+    /**
+     * @param string $path
+     * @return array
+     */
     public function getFileVersions(string $path): array
     {
         try {
@@ -277,6 +371,11 @@ class MinioStorageService implements MinioServiceInterface
         }
     }
 
+    /**
+     * @param string $path
+     * @param string $versionId
+     * @return void
+     */
     public function restoreFileVersion(string $path, string $versionId): void
     {
         try {
@@ -290,6 +389,9 @@ class MinioStorageService implements MinioServiceInterface
         }
     }
 
+    /**
+     * @throws FilesystemException
+     */
     public function encryptAndUploadFile(string $path, string $content, string $encryptionKey): void
     {
         $cipher = 'AES-256-CBC';
@@ -301,6 +403,11 @@ class MinioStorageService implements MinioServiceInterface
         $this->uploadFile($path, $dataToStore);
     }
 
+    /**
+     * @param string $path
+     * @param string $encryptionKey
+     * @return string|null
+     */
     public function decryptFile(string $path, string $encryptionKey): ?string
     {
         $data = $this->getFileContent($path);
@@ -315,6 +422,9 @@ class MinioStorageService implements MinioServiceInterface
         return openssl_decrypt($encrypted, $cipher, $encryptionKey, 0, $iv);
     }
 
+    /**
+     * @throws FilesystemException
+     */
     public function compressAndUploadFile(string $path, string $content, string $compressionType = 'gzip'): void
     {
         if ($compressionType === 'gzip') {
@@ -326,6 +436,11 @@ class MinioStorageService implements MinioServiceInterface
         }
     }
 
+    /**
+     * @param string $path
+     * @param string $compressionType
+     * @return string|null
+     */
     public function decompressFile(string $path, string $compressionType = 'gzip'): ?string
     {
         $compressed = $this->getFileContent($path);
@@ -339,6 +454,10 @@ class MinioStorageService implements MinioServiceInterface
         }
     }
 
+    /**
+     * @param string $path
+     * @return string
+     */
     public function multipartUploadInit(string $path): string
     {
         try {
@@ -353,6 +472,13 @@ class MinioStorageService implements MinioServiceInterface
         }
     }
 
+    /**
+     * @param string $uploadId
+     * @param string $path
+     * @param int $partNumber
+     * @param string $data
+     * @return void
+     */
     public function multipartUploadPart(string $uploadId, string $path, int $partNumber, string $data): void
     {
         try {
@@ -369,6 +495,11 @@ class MinioStorageService implements MinioServiceInterface
         }
     }
 
+    /**
+     * @param string $uploadId
+     * @param string $path
+     * @return void
+     */
     public function multipartUploadComplete(string $uploadId, string $path): void
     {
         // NOTE: In a production environment, you should store each part's ETag from multipartUploadPart.
@@ -400,6 +531,10 @@ class MinioStorageService implements MinioServiceInterface
         }
     }
 
+    /**
+     * @param string $path
+     * @return array
+     */
     public function getFileAccessLogs(string $path): array
     {
         // S3/MinIO does not provide per-object access logs by default.
@@ -407,6 +542,9 @@ class MinioStorageService implements MinioServiceInterface
         return [];
     }
 
+    /**
+     * @return array
+     */
     public function getStorageUsage(): array
     {
         try {
