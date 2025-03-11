@@ -1,0 +1,24 @@
+{
+  "name": "intelligent-intern/minio-storage-bundle",
+  "description": "Intelligent Intern storage bundle for minio integration",
+  "type": "intelligent-intern-bundle",
+  "license": "MIT",
+  "autoload": {
+    "psr-4": {
+      "IntelligentIntern\\MinioStorageBundle\\": "src/"
+    }
+  },
+  "require": {
+    "php": "^8.2",
+    "symfony/http-client": "7.2.*",
+    "symfony/framework-bundle": "7.2.*",
+    "league/flysystem":"^3.0",
+    "async-aws/s3": "^2.8"
+  },
+  "extra": {
+    "branch-alias": {
+      "dev-main": "1.0-dev"
+    }
+  }
+}
+
