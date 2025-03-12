@@ -26,47 +26,74 @@ class MinioStorageService implements StorageServiceInterface
     private FilesystemOperator $storage;
     private S3Client $s3Client;
     private string $bucket;
+    private string $region;
+    private string $version;
+    private bool $usePathStyleEndpoint;
+    private bool|string $verify;
+    private string $endpoint;
+    private string $username;
+    private string $password;
 
     /**
-     * @throws TransportExceptionInterface
-     * @throws ServerExceptionInterface
-     * @throws RedirectionExceptionInterface
-     * @throws DecodingExceptionInterface
+     * @param VaultService $vaultService
+     * @param LogServiceFactory $logServiceFactory
      * @throws ClientExceptionInterface
+     * @throws DecodingExceptionInterface
+     * @throws RedirectionExceptionInterface
+     * @throws ServerExceptionInterface
+     * @throws TransportExceptionInterface
      */
     public function __construct(
         private readonly VaultService $vaultService,
         private readonly LogServiceFactory $logServiceFactory
     ) {
         $this->logger = $this->logServiceFactory->create();
-        $minioConfig = $this->vaultService->fetchSecret('secret/data/data/minio');
+        $minioConfig = $this->vaultService->fetchSecret('secret/data/minio');
 
-        $minioUrl  = $minioConfig['url'] ?? throw new RuntimeException('_URL not found in Vault.');
-        $username  = $minioConfig['username'] ?? throw new RuntimeException('_USERNAME not found in Vault.');
-        $password  = $minioConfig['password'] ?? throw new RuntimeException('_PASSWORD not found in Vault.');
-        $this->bucket = $minioConfig['bucket'] ?? 'default-bucket';
+        $this->endpoint = $minioConfig['minio_endpoint']
+            ?? throw new RuntimeException('MinIO endpoint not found in Vault.');
+        $this->username = $minioConfig['minio_access_key']
+            ?? throw new RuntimeException('MinIO access key not found in Vault.');
+        $this->password = $minioConfig['minio_secret_key']
+            ?? throw new RuntimeException('MinIO secret key not found in Vault.');
+        $this->bucket   = $minioConfig['incoming_bucket']
+            ?? 'default-incoming-bucket';
+        $this->region   = $minioConfig['region']
+            ?? 'us-east-1';
+        $this->version  = $minioConfig['version']
+            ?? 'latest';
+        $this->usePathStyleEndpoint = !isset($minioConfig['minio_use_local_log_storage'])
+            || $minioConfig['minio_use_local_log_storage'];
+        $this->verify = $minioConfig['verify']
+            ?? false;
 
-        // Create the S3 client. (Additional options such as certificates can be added if needed.)
+        $this->initializeClient();
+    }
+
+    private function initializeClient(): void
+    {
         $this->s3Client = new S3Client([
-            'version'                 => 'latest',
-            'region'                  => 'us-east-1', // Dummy region for MinIO
-            'endpoint'                => $minioUrl,
+            'version'                 => $this->version,
+            'region'                  => $this->region,
+            'endpoint'                => $this->endpoint,
             'credentials'             => [
-                'key'    => $username,
-                'secret' => $password,
+                'key'    => $this->username,
+                'secret' => $this->password,
             ],
-            'use_path_style_endpoint' => true, // Important for MinIO
-            // 'verify'              => '/path/to/certificate.pem', // Uncomment if you need to add a certificate
+            'use_path_style_endpoint' => $this->usePathStyleEndpoint,
+            'verify'                  => $this->verify,
         ]);
-
-        // Create the Flysystem adapter and FilesystemOperator instance
         $adapter = new AwsS3V3Adapter($this->s3Client, $this->bucket);
         $this->storage = new Filesystem($adapter);
     }
 
+    private function updateS3Client(): void
+    {
+        $this->initializeClient();
+    }
+
     /**
-     * @param string $provider
-     * @return bool
+     * @inheritDoc
      */
     public function supports(string $provider): bool
     {
@@ -74,48 +101,152 @@ class MinioStorageService implements StorageServiceInterface
     }
 
     /**
-     * @param string $path
-     * @return string|null
+     * @inheritDoc
      */
-    public function generatePresignedUrl(string $path): ?string
+    public function setRegion(string $region): void
     {
-        // Generate a temporary URL valid for 1 hour by default.
-        return $this->storage->temporaryUrl($path, new DateTime('+1 hour'));
+        $this->region = $region;
+        $this->updateS3Client();
     }
 
     /**
-     * @param string $path
-     * @param int $expirySeconds
-     * @return string|null
+     * @inheritDoc
      */
-    public function generateExpiringDownloadUrl(string $path, int $expirySeconds): ?string
+    public function getRegion(): string
     {
-        $expiry = new DateTime("+{$expirySeconds} seconds");
-        return $this->storage->temporaryUrl($path, $expiry);
+        return $this->region;
     }
 
     /**
-     * @param string $path
-     * @param int $expirySeconds
-     * @return string|null
+     * @inheritDoc
      */
-    public function generateExpiringUploadUrl(string $path, int $expirySeconds): ?string
+    public function setVersion(string $version): void
     {
-        $expiry = "+{$expirySeconds} seconds";
+        $this->version = $version;
+        $this->updateS3Client();
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function getVersion(): string
+    {
+        return $this->version;
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function setUsePathStyleEndpoint(bool $usePathStyleEndpoint): void
+    {
+        $this->usePathStyleEndpoint = $usePathStyleEndpoint;
+        $this->updateS3Client();
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function getUsePathStyleEndpoint(): bool
+    {
+        return $this->usePathStyleEndpoint;
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function setVerify(bool|string $verify): void
+    {
+        $this->verify = $verify;
+        $this->updateS3Client();
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function getVerify(): bool|string
+    {
+        return $this->verify;
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function createBucket(string $bucket): void
+    {
         try {
-            $command = $this->s3Client->getCommand('PutObject', [
-                'Bucket' => $this->bucket,
-                'Key'    => $path,
-            ]);
-            $request = $this->s3Client->createPresignedRequest($command, $expiry);
-            return (string)$request->getUri();
+            $this->s3Client->createBucket(['Bucket' => $bucket]);
         } catch (AwsException $e) {
-            $this->logger->error('Error generating expiring upload URL: ' . $e->getMessage());
-            return null;
+            throw new RuntimeException("Bucket creation failed: " . $e->getMessage());
         }
     }
 
     /**
+     * @inheritDoc
+     */
+    public function deleteBucket(string $bucket): void
+    {
+        try {
+            $this->s3Client->deleteBucket(['Bucket' => $bucket]);
+        } catch (AwsException $e) {
+            throw new RuntimeException("Bucket deletion failed: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function setBucketEvents(string $bucket, array $events): void
+    {
+        try {
+            $this->s3Client->putBucketNotificationConfiguration([
+                'Bucket'                    => $bucket,
+                'NotificationConfiguration' => $events,
+            ]);
+        } catch (AwsException $e) {
+            throw new RuntimeException("Setting bucket events failed: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function getStorageUsage(): array
+    {
+        try {
+            $result = $this->s3Client->listObjectsV2(['Bucket' => $this->bucket]);
+            $totalSize = array_sum(array_column($result['Contents'] ?? [], 'Size'));
+            $objectCount = count($result['Contents'] ?? []);
+            return ['total_size' => $totalSize, 'object_count' => $objectCount];
+        } catch (AwsException) {
+            return [];
+        }
+    }
+
+    /**
+     * @inheritDoc
+     * @throws FilesystemException
+     */
+    public function encryptAndUploadFile(string $path, string $content, string $encryptionKey): void
+    {
+        $cipher = 'AES-256-CBC';
+        $iv = random_bytes(openssl_cipher_iv_length($cipher));
+        $encrypted = openssl_encrypt($content, $cipher, $encryptionKey, 0, $iv);
+        $this->uploadFile($path, base64_encode($iv . $encrypted));
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function decryptFile(string $path, string $encryptionKey): ?string
+    {
+        $data = base64_decode($this->getFileContent($path) ?? '');
+        $cipher = 'AES-256-CBC';
+        $ivLength = openssl_cipher_iv_length($cipher);
+        return openssl_decrypt(substr($data, $ivLength), $cipher, $encryptionKey, 0, substr($data, 0, $ivLength));
+    }
+
+    /**
+     * @inheritDoc
      * @throws FilesystemException
      */
     public function uploadFile(string $path, string $content): void
@@ -124,6 +255,7 @@ class MinioStorageService implements StorageServiceInterface
     }
 
     /**
+     * @inheritDoc
      * @throws FilesystemException
      */
     public function deleteFile(string $path): void
@@ -132,8 +264,7 @@ class MinioStorageService implements StorageServiceInterface
     }
 
     /**
-     * @param string $path
-     * @return bool
+     * @inheritDoc
      * @throws FilesystemException
      */
     public function fileExists(string $path): bool
@@ -142,41 +273,31 @@ class MinioStorageService implements StorageServiceInterface
     }
 
     /**
-     * @param string $path
-     * @return string|null
+     * @inheritDoc
      */
     public function getFileContent(string $path): ?string
     {
         try {
             return $this->storage->read($path);
-        } catch (FilesystemException $e) {
-            $this->logger->error("Error reading file [$path]: " . $e->getMessage());
+        } catch (FilesystemException) {
             return null;
         }
     }
 
     /**
-     * @param string $directory
-     * @return array
+     * @inheritDoc
      * @throws FilesystemException
      */
     public function listFiles(string $directory): array
     {
-        $files = [];
-        $listing = $this->storage->listContents($directory, false);
-        foreach ($listing as $item) {
-            // Depending on your Flysystem version, adjust accordingly.
-            if (isset($item['type']) && $item['type'] === 'file') {
-                $files[] = $item['path'];
-            }
-        }
-        return $files;
+        return array_map(fn($item) => $item['path'], array_filter(
+            (array)$this->storage->listContents($directory, false),
+            fn($item) => isset($item['type']) && $item['type'] === 'file'
+        ));
     }
 
     /**
-     * @param string $sourcePath
-     * @param string $destinationPath
-     * @return void
+     * @inheritDoc
      * @throws FilesystemException
      */
     public function copyFile(string $sourcePath, string $destinationPath): void
@@ -185,9 +306,7 @@ class MinioStorageService implements StorageServiceInterface
     }
 
     /**
-     * @param string $sourcePath
-     * @param string $destinationPath
-     * @return void
+     * @inheritDoc
      * @throws FilesystemException
      */
     public function moveFile(string $sourcePath, string $destinationPath): void
@@ -196,8 +315,7 @@ class MinioStorageService implements StorageServiceInterface
     }
 
     /**
-     * @param string $path
-     * @return array
+     * @inheritDoc
      */
     public function getFileMetadata(string $path): array
     {
@@ -209,23 +327,17 @@ class MinioStorageService implements StorageServiceInterface
                 'visibility'   => $this->storage->visibility($path),
             ];
         } catch (FilesystemException $e) {
-            $this->logger->error("Error getting metadata for [$path]: " . $e->getMessage());
             return [];
         }
     }
 
     /**
-     * @param string $path
-     * @param array $metadata
-     * @return void
+     * @inheritDoc
      */
     public function setFileMetadata(string $path, array $metadata): void
     {
-        // Flysystem does not directly support updating metadata.
-        // Using S3Client to copy the object onto itself with new metadata.
         try {
             $existingContent = $this->storage->read($path);
-            // Copying the object with updated metadata (this may create a new version if versioning is enabled)
             $this->s3Client->putObject([
                 'Bucket'   => $this->bucket,
                 'Key'      => $path,
@@ -233,67 +345,21 @@ class MinioStorageService implements StorageServiceInterface
                 'Metadata' => $metadata,
             ]);
         } catch (FilesystemException | AwsException $e) {
-            $this->logger->error("Error setting metadata for [$path]: " . $e->getMessage());
+            throw new RuntimeException("Error setting metadata: " . $e->getMessage());
         }
     }
 
     /**
-     * @param string $path
-     * @param array $tags
-     * @return void
-     */
-    public function tagFile(string $path, array $tags): void
-    {
-        $tagSet = [];
-        foreach ($tags as $key => $value) {
-            $tagSet[] = ['Key' => $key, 'Value' => $value];
-        }
-        try {
-            $this->s3Client->putObjectTagging([
-                'Bucket'  => $this->bucket,
-                'Key'     => $path,
-                'Tagging' => ['TagSet' => $tagSet],
-            ]);
-        } catch (AwsException $e) {
-            $this->logger->error("Error tagging file [$path]: " . $e->getMessage());
-        }
-    }
-
-    /**
-     * @param string $path
-     * @return array
-     */
-    public function getFileTags(string $path): array
-    {
-        try {
-            $result = $this->s3Client->getObjectTagging([
-                'Bucket' => $this->bucket,
-                'Key'    => $path,
-            ]);
-            $tags = [];
-            foreach ($result['TagSet'] as $tag) {
-                $tags[$tag['Key']] = $tag['Value'];
-            }
-            return $tags;
-        } catch (AwsException $e) {
-            $this->logger->error("Error retrieving tags for [$path]: " . $e->getMessage());
-            return [];
-        }
-    }
-
-    /**
-     * @param string $path
-     * @param string $visibility
-     * @return void
+     * @inheritDoc
      * @throws FilesystemException
      */
     public function setFileVisibility(string $path, string $visibility): void
     {
-        // Flysystem supports visibility updates.
         $this->storage->setVisibility($path, $visibility);
     }
 
     /**
+     * @inheritDoc
      * @throws FilesystemException
      */
     public function getFileVisibility(string $path): string
@@ -302,24 +368,25 @@ class MinioStorageService implements StorageServiceInterface
     }
 
     /**
+     * @inheritDoc
      * @throws FilesystemException
      */
     public function streamFile(string $path)
     {
-        // Returns a stream resource
         return $this->storage->readStream($path);
     }
 
     /**
+     * @inheritDoc
      * @throws FilesystemException
      */
     public function createDirectory(string $path): void
     {
-        // S3 is object storage, but Flysystem simulates directories.
         $this->storage->createDirectory($path);
     }
 
     /**
+     * @inheritDoc
      * @throws FilesystemException
      */
     public function deleteDirectory(string $path): void
@@ -328,53 +395,38 @@ class MinioStorageService implements StorageServiceInterface
     }
 
     /**
+     * @inheritDoc
      * @throws FilesystemException
      */
     public function getFileChecksum(string $path, string $algorithm = 'sha256'): string
     {
-        $content = $this->storage->read($path);
-        return hash($algorithm, $content);
+        return hash($algorithm, $this->storage->read($path));
     }
 
     /**
+     * @inheritDoc
      * @throws FilesystemException
      */
     public function validateFileChecksum(string $path, string $expectedHash, string $algorithm = 'sha256'): bool
     {
-        $computed = $this->getFileChecksum($path, $algorithm);
-        return $computed === $expectedHash;
+        return $this->getFileChecksum($path, $algorithm) === $expectedHash;
     }
 
     /**
-     * @param string $path
-     * @return array
+     * @inheritDoc
      */
     public function getFileVersions(string $path): array
     {
         try {
-            $result = $this->s3Client->listObjectVersions([
-                'Bucket' => $this->bucket,
-                'Prefix' => $path,
-            ]);
-            $versions = [];
-            if (isset($result['Versions'])) {
-                foreach ($result['Versions'] as $version) {
-                    if ($version['Key'] === $path) {
-                        $versions[] = $version;
-                    }
-                }
-            }
-            return $versions;
+            $result = $this->s3Client->listObjectVersions(['Bucket' => $this->bucket, 'Prefix' => $path]);
+            return $result['Versions'] ?? [];
         } catch (AwsException $e) {
-            $this->logger->error("Error getting versions for [$path]: " . $e->getMessage());
             return [];
         }
     }
 
     /**
-     * @param string $path
-     * @param string $versionId
-     * @return void
+     * @inheritDoc
      */
     public function restoreFileVersion(string $path, string $versionId): void
     {
@@ -385,45 +437,41 @@ class MinioStorageService implements StorageServiceInterface
                 'Key'        => $path,
             ]);
         } catch (AwsException $e) {
-            $this->logger->error("Error restoring version [$versionId] for [$path]: " . $e->getMessage());
+            throw new RuntimeException("Error restoring file version: " . $e->getMessage());
         }
     }
 
     /**
-     * @throws FilesystemException
+     * @inheritDoc
      */
-    public function encryptAndUploadFile(string $path, string $content, string $encryptionKey): void
+    public function generateExpiringDownloadUrl(string $path, int $expirySeconds): ?string
     {
-        $cipher = 'AES-256-CBC';
-        $ivLength = openssl_cipher_iv_length($cipher);
-        $iv = openssl_random_pseudo_bytes($ivLength);
-        $encrypted = openssl_encrypt($content, $cipher, $encryptionKey, 0, $iv);
-        // Prepend the IV so it can be used in decryption
-        $dataToStore = base64_encode($iv . $encrypted);
-        $this->uploadFile($path, $dataToStore);
+        return $this->storage->temporaryUrl($path, new DateTime("+{$expirySeconds} seconds"));
     }
 
     /**
-     * @param string $path
-     * @param string $encryptionKey
-     * @return string|null
+     * @inheritDoc
      */
-    public function decryptFile(string $path, string $encryptionKey): ?string
+    public function generateExpiringUploadUrl(string $path, int $expirySeconds): ?string
     {
-        $data = $this->getFileContent($path);
-        if ($data === null) {
+        try {
+            $command = $this->s3Client->getCommand('PutObject', ['Bucket' => $this->bucket, 'Key' => $path]);
+            return (string) $this->s3Client->createPresignedRequest($command, "+{$expirySeconds} seconds")->getUri();
+        } catch (AwsException $e) {
             return null;
         }
-        $data = base64_decode($data);
-        $cipher = 'AES-256-CBC';
-        $ivLength = openssl_cipher_iv_length($cipher);
-        $iv = substr($data, 0, $ivLength);
-        $encrypted = substr($data, $ivLength);
-        return openssl_decrypt($encrypted, $cipher, $encryptionKey, 0, $iv);
     }
 
     /**
-     * @throws FilesystemException
+     * @inheritDoc
+     */
+    public function getFileAccessLogs(string $path): array
+    {
+        return [];
+    }
+
+    /**
+     * @inheritDoc
      */
     public function compressAndUploadFile(string $path, string $content, string $compressionType = 'gzip'): void
     {
@@ -431,15 +479,12 @@ class MinioStorageService implements StorageServiceInterface
             $compressed = gzcompress($content);
             $this->uploadFile($path, $compressed);
         } else {
-            // Other compression types can be implemented as needed.
             throw new RuntimeException("Compression type [$compressionType] not supported.");
         }
     }
 
     /**
-     * @param string $path
-     * @param string $compressionType
-     * @return string|null
+     * @inheritDoc
      */
     public function decompressFile(string $path, string $compressionType = 'gzip'): ?string
     {
@@ -455,29 +500,20 @@ class MinioStorageService implements StorageServiceInterface
     }
 
     /**
-     * @param string $path
-     * @return string
+     * @inheritDoc
      */
     public function multipartUploadInit(string $path): string
     {
         try {
-            $result = $this->s3Client->createMultipartUpload([
-                'Bucket' => $this->bucket,
-                'Key'    => $path,
-            ]);
+            $result = $this->s3Client->createMultipartUpload(['Bucket' => $this->bucket, 'Key' => $path]);
             return $result['UploadId'];
         } catch (AwsException $e) {
-            $this->logger->error("Error initiating multipart upload for [$path]: " . $e->getMessage());
-            throw new RuntimeException("Multipart upload initiation failed.");
+            throw new RuntimeException("Multipart upload initiation failed: " . $e->getMessage());
         }
     }
 
     /**
-     * @param string $uploadId
-     * @param string $path
-     * @param int $partNumber
-     * @param string $data
-     * @return void
+     * @inheritDoc
      */
     public function multipartUploadPart(string $uploadId, string $path, int $partNumber, string $data): void
     {
@@ -490,35 +526,22 @@ class MinioStorageService implements StorageServiceInterface
                 'Body'       => $data,
             ]);
         } catch (AwsException $e) {
-            $this->logger->error("Error uploading part [$partNumber] for [$path]: " . $e->getMessage());
-            throw new RuntimeException("Multipart upload part failed.");
+            throw new RuntimeException("Multipart upload part failed: " . $e->getMessage());
         }
     }
 
     /**
-     * @param string $uploadId
-     * @param string $path
-     * @return void
+     * @inheritDoc
      */
     public function multipartUploadComplete(string $uploadId, string $path): void
     {
-        // NOTE: In a production environment, you should store each part's ETag from multipartUploadPart.
-        // For simplicity, we list the parts here (which may not be fully reliable if the number of parts is large).
         try {
             $result = $this->s3Client->listParts([
                 'Bucket'   => $this->bucket,
                 'Key'      => $path,
                 'UploadId' => $uploadId,
             ]);
-            $parts = [];
-            if (isset($result['Parts'])) {
-                foreach ($result['Parts'] as $part) {
-                    $parts[] = [
-                        'ETag'       => $part['ETag'],
-                        'PartNumber' => $part['PartNumber'],
-                    ];
-                }
-            }
+            $parts = array_map(fn($part) => ['ETag' => $part['ETag'], 'PartNumber' => $part['PartNumber']], $result['Parts'] ?? []);
             $this->s3Client->completeMultipartUpload([
                 'Bucket'          => $this->bucket,
                 'Key'             => $path,
@@ -526,46 +549,46 @@ class MinioStorageService implements StorageServiceInterface
                 'MultipartUpload' => ['Parts' => $parts],
             ]);
         } catch (AwsException $e) {
-            $this->logger->error("Error completing multipart upload for [$path]: " . $e->getMessage());
-            throw new RuntimeException("Multipart upload completion failed.");
+            throw new RuntimeException("Multipart upload completion failed: " . $e->getMessage());
         }
     }
 
     /**
-     * @param string $path
-     * @return array
+     * @inheritDoc
      */
-    public function getFileAccessLogs(string $path): array
+    public function tagFile(string $path, array $tags): void
     {
-        // S3/MinIO does not provide per-object access logs by default.
-        // This would normally be implemented via CloudTrail or another logging service.
-        return [];
+        $tagSet = array_map(fn($key, $value) => ['Key' => $key, 'Value' => $value], array_keys($tags), $tags);
+        try {
+            $this->s3Client->putObjectTagging([
+                'Bucket'  => $this->bucket,
+                'Key'     => $path,
+                'Tagging' => ['TagSet' => $tagSet],
+            ]);
+        } catch (AwsException $e) {
+            throw new RuntimeException("Error tagging file [$path]: " . $e->getMessage());
+        }
     }
 
     /**
-     * @return array
+     * @inheritDoc
      */
-    public function getStorageUsage(): array
+    public function getFileTags(string $path): array
     {
         try {
-            $result = $this->s3Client->listObjectsV2([
-                'Bucket' => $this->bucket,
-            ]);
-            $totalSize = 0;
-            $objectCount = 0;
-            if (isset($result['Contents'])) {
-                foreach ($result['Contents'] as $object) {
-                    $totalSize += $object['Size'];
-                    $objectCount++;
-                }
-            }
-            return [
-                'total_size'   => $totalSize,
-                'object_count' => $objectCount,
-            ];
+            $result = $this->s3Client->getObjectTagging(['Bucket' => $this->bucket, 'Key' => $path]);
+            return array_column($result['TagSet'] ?? [], 'Value', 'Key');
         } catch (AwsException $e) {
-            $this->logger->error("Error getting storage usage: " . $e->getMessage());
             return [];
         }
     }
+
+    /**
+     * @inheritDoc
+     */
+    public function generatePreSignedUrl(string $path): ?string
+    {
+        return $this->storage->temporaryUrl($path, new \DateTime('+1 hour'));
+    }
+
 }
